@@ -21,6 +21,7 @@ local CONFIG = {
     AutoHatch = true,             -- hatch when a rank / zone-gate goal or crafting fodder needs it
     AlwaysHatch = false,          -- hatch the best egg nonstop, even with coins the next zone needs
     HatchForStrength = true,      -- hatch the best egg with coins the next zone does not need (stronger pets)
+    RankFocus = true,             -- until max rank: rebirths / zones / worlds only when the rank needs them, coins go to quests
     HatchShare = 0.2,             -- while saving for a zone, this share of the balance may still go to eggs/upgrades (0 = zones strictly first)
     AutoCraft = true,             -- gold / rainbow machine for goals
     AutoItems = true,             -- potions / fruits / flags / potion+enchant upgrades for goals
@@ -507,6 +508,8 @@ local STATE_FILE = nil
 -- "Machine@PlaceId" -> { x, y, z, zone }. Machines stream in and out with their zone (MachineCmds.All
 -- only lists loaded ones, verified live), so every machine is remembered once seen and survives rejoins.
 local machineSeen = {}
+-- "EggNumber@PlaceId" -> { x, y, z }: World 3 capsules stream in only near the player (see eggPosition)
+local eggSeen = {}
 local function stateFile()
     if not STATE_FILE and LocalPlayer then
         STATE_FILE = string.format("Hayami_PS99_%d.json", LocalPlayer.UserId) -- per account: many clients share one workspace
@@ -524,6 +527,7 @@ persist = function()
             lastWorldSwitch = state.lastWorldSwitch,
             counters = state.counters,
             machines = machineSeen,
+            eggs = eggSeen,
         }))
     end)
 end
@@ -540,6 +544,13 @@ local function restore()
         for k, v in pairs(data.machines) do
             if type(k) == "string" and type(v) == "table" and tonumber(v[1]) and tonumber(v[2]) and tonumber(v[3]) then
                 machineSeen[k] = v
+            end
+        end
+    end
+    if type(data.eggs) == "table" then
+        for k, v in pairs(data.eggs) do
+            if type(k) == "string" and type(v) == "table" and tonumber(v[1]) and tonumber(v[2]) and tonumber(v[3]) then
+                eggSeen[k] = v
             end
         end
     end
@@ -751,14 +762,43 @@ local function breakPart(zoneId)
 end
 
 -- EggsUtil.GetEggPosition reads ReplicatedStorage.ZoneEggIndex, which has no entry for some eggs
--- (verified live: 40 Zebra Egg). The egg capsule model is the fallback; nil = not in this world.
-local function eggPosition(n)
-    if type(n) ~= "number" then return nil end
-    local pos = isfn(G.EggsUtil, "GetEggPosition") and gv(G.EggsUtil.GetEggPosition, n) or nil
-    if typeof(pos) == "Vector3" then return pos end
-    local part = isfn(G.EggsUtil, "GetEggPart") and gv(G.EggsUtil.GetEggPart, n) or nil
-    if typeof(part) == "Instance" and part:IsA("BasePart") then return part.Position end
-    return nil
+-- (verified live: 40 Zebra Egg). The egg capsule model is the fallback. World 3 uses neither (both empty,
+-- verified live): its capsules stream into __THINGS.Eggs.World3 as "<n> - Egg Capsule" only while the
+-- player is near, so every capsule seen is remembered; stepHatch visits the egg's zone for a missing one.
+local eggPosition
+do
+    local function liveCapsule(n)
+        local things = workspace:FindFirstChild("__THINGS")
+        local eggs = things and things:FindFirstChild("Eggs")
+        if not eggs then return nil end
+        local name = string.format("%d - Egg Capsule", n)
+        for _, w in ipairs(eggs:GetChildren()) do
+            local cap = w:FindFirstChild(name)
+            if cap then
+                local c = cap:FindFirstChild("Center")
+                local part = (c and c:IsA("BasePart") and c) or cap:FindFirstChildWhichIsA("BasePart", true)
+                if part then return part.Position end
+            end
+        end
+        return nil
+    end
+
+    eggPosition = function(n)
+        if type(n) ~= "number" then return nil end
+        local pos = isfn(G.EggsUtil, "GetEggPosition") and gv(G.EggsUtil.GetEggPosition, n) or nil
+        if typeof(pos) == "Vector3" then return pos end
+        local part = isfn(G.EggsUtil, "GetEggPart") and gv(G.EggsUtil.GetEggPart, n) or nil
+        if typeof(part) == "Instance" and part:IsA("BasePart") then return part.Position end
+        local key = n .. "@" .. tostring(game.PlaceId)
+        local live = liveCapsule(n)
+        if live then
+            eggSeen[key] = { live.X, live.Y, live.Z }
+            return live
+        end
+        local seen = eggSeen[key]
+        if seen then return Vector3.new(seen[1], seen[2], seen[3]) end
+        return nil
+    end
 end
 
 -- Break-zone center, or while hatching the break-zone point nearest the egg: farming and hatching
@@ -1216,6 +1256,12 @@ local function readRank(save)
         info.blockedByZone, info.blockedByRebirth, info.zoneNeeded, info.rebirthsNeeded = bz == true, br == true, zn, rn
     end
     return info
+end
+
+-- Rank quests first: true while ranks remain and RankFocus is on.
+local function rankFocused()
+    local r = state.rank
+    return CONFIG.RankFocus and r ~= nil and not r.isMax
 end
 
 local function claimRanks(info)
@@ -1935,12 +1981,35 @@ do
         return true
     end
 
+    -- Rank focus: zones, rebirths and new worlds only when the rank or a quest needs them. Breakable / hatch
+    -- quests count items, not coins, and a deeper zone only makes breakables tougher and eggs dearer.
+    local function rankNeedsZones()
+        local r = state.rank
+        if r and (r.blockedByZone or r.blockedByRebirth) then return true end
+        if state.gate then return true end
+        for _, g in ipairs(state.goals) do
+            if ZONE_GOALS[g.name] and g.remaining > 0 then return true end
+        end
+        return false
+    end
+
+    -- next zone exists but sits above the rebirth requirement: zones cannot move without a rebirth
+    local function zoneWaitsForRebirth()
+        local nd, nr = state.nextZoneDir, state.nextRebirth
+        return nd ~= nil and type(nr) == "table" and tonumber(nr.ZoneNumberRequired) ~= nil
+            and (tonumber(nd.ZoneNumber) or 0) > tonumber(nr.ZoneNumberRequired)
+    end
+
     local function stepWorld()
         if state.worldSwitching then
             if os.clock() - state.worldSwitchAt > 60 then state.worldSwitching = false end
             return true
         end
         if not CONFIG.AutoWorldTeleport or not state.world or not ready("worldCheck", 10) then return false end
+        -- focused: a new world only once the rank needs a zone this world has run out of
+        if rankFocused() and not (state.rank.blockedByZone and (state.nextZoneDir == nil or state.nextZoneDir.WorldNumber ~= state.world)) then
+            return false
+        end
         if not isfn(G.TeleportMapCmds, "CanTeleportToWorldRaw") then return false end
         local target = nil
         for w = state.world + 1, state.world + 3 do
@@ -1952,6 +2021,8 @@ do
 
     local function stepRebirth()
         if not CONFIG.AutoRebirth or not isfn(G.RebirthCmds, "GetNextRebirth") or not ready("rebirth", 8) then return end
+        -- a rebirth resets every zone: focused, only when the rank asks for it or zones the rank needs wait on it
+        if rankFocused() and not (state.rank.blockedByRebirth or (rankNeedsZones() and zoneWaitsForRebirth())) then return end
         local nr = state.nextRebirth
         if type(nr) ~= "table" or nr._id == nil then return end
         local need = tonumber(nr.ZoneNumberRequired)
@@ -1971,6 +2042,7 @@ do
 
     local function stepZone()
         if not CONFIG.AutoZones or not ready("zone", 2) then return end
+        if rankFocused() and not rankNeedsZones() then return end
         local id, dir = state.nextZoneId, state.nextZoneDir
         if not (id and dir) then return end
         if state.world and dir.WorldNumber ~= state.world then return end -- next world: stepWorld handles it
@@ -2023,6 +2095,7 @@ do
     local function zoneReserve()
         local nd = state.nextZoneDir
         if not CONFIG.AutoZones or not nd or state.gate then return 0, nil end
+        if rankFocused() and not rankNeedsZones() then return 0, nil end -- not saving for a zone we will not buy
         if state.world and nd.WorldNumber ~= state.world then return 0, nil end
         local nr = state.nextRebirth
         if type(nr) == "table" and tonumber(nr.ZoneNumberRequired) and (tonumber(nd.ZoneNumber) or 0) > tonumber(nr.ZoneNumberRequired) then
@@ -2057,7 +2130,7 @@ do
             if bought < maxSlots then
                 local idx = bought + 1
                 local price = type(G.Balancing) == "table" and isfn(G.Balancing, "CalcPetSlotPrice") and gv(G.Balancing.CalcPetSlotPrice, idx) or nil
-                if canAfford("Diamonds", price) then
+                if canAfford("Diamonds", price) and machineAllowed("EquipSlotsMachine") then
                     setDoing("Buying pet slot " .. idx)
                     local ok, res, msg = withMachine("EquipSlotsMachine", netInvoke, "EquipSlotsMachine_RequestPurchase", idx)
                     if ok and res then
@@ -2084,7 +2157,7 @@ do
                         price += p
                     end
                 end
-                if canAfford("Diamonds", price) then
+                if canAfford("Diamonds", price) and machineAllowed("EggSlotsMachine") then
                     setDoing("Buying egg slots")
                     local ok, res, msg = withMachine("EggSlotsMachine", netInvoke, "EggHatchSlotsMachine_RequestPurchase", bundle.End)
                     if ok and res then
@@ -2281,6 +2354,37 @@ do
         state.hatchNote, state.hatchNoteAt = text, os.clock()
     end
 
+    local zoneByNumber = nil
+    local function zoneIdByNumber(num)
+        if not zoneByNumber then
+            zoneByNumber = {}
+            for id, z in pairs(type(G.Zones) == "table" and G.Zones or {}) do
+                local zn = type(z) == "table" and tonumber(z.ZoneNumber) or nil
+                if zn then zoneByNumber[zn] = id end
+            end
+        end
+        return zoneByNumber[num]
+    end
+
+    -- World 3 egg capsules load only near the player (verified live: the best egg's capsule was missing until
+    -- its zone was visited). Stand in the egg's zone once; the capsule position is then remembered.
+    local function visitEggZone(egg)
+        local num = tonumber(type(egg.dir) == "table" and egg.dir.zoneNumber)
+        if not num or not ready("eggVisit:" .. tostring(egg.id), 90) then return false end
+        local zoneId = zoneIdByNumber(num)
+        if not zoneId then return false end
+        setDoing("Finding " .. tostring(egg.name))
+        state.busy = true
+        serverZoneTeleport(zoneId)
+        local t0 = os.clock()
+        repeat task.wait(0.5) until eggPosition(egg.n) ~= nil or os.clock() - t0 > 10 or not state.alive
+        state.busy = false
+        state.forceEnsure = true
+        local found = eggPosition(egg.n) ~= nil
+        log("egg %s %s after visiting %s", tostring(egg.id), found and "found" or "still missing", tostring(zoneId))
+        return found
+    end
+
     local function stepHatch()
         local req = state.plan.hatch
         if not req or not CONFIG.AutoHatch or os.clock() < state.hatchBackoff or inInstance() then return end
@@ -2306,6 +2410,8 @@ do
         amount = math.max(1, math.floor(amount))
         local hrp = getHRP()
         local pos = eggPosition(egg.n)
+        -- found: the next tick hatches, after the zone teleport has settled (the 6 s guard above)
+        if not pos and visitEggZone(egg) then return end
         if not pos then
             -- unknown position used to read as distance 0: no hop, and a refusal every 5 s forever
             strike("hatch:" .. egg.id, "egg position unknown")
@@ -2420,7 +2526,7 @@ do
 
     -- Map upgrade stations (UpgradeCmds): cheapest affordable one first, one per pass.
     local function stepUpgrades()
-        if not (CONFIG.AutoUpgrades or wantsGoal("MAP_UPGRADE")) or not ready("upgrades", 10) then return end
+        if not ((CONFIG.AutoUpgrades and not rankFocused()) or wantsGoal("MAP_UPGRADE")) or not ready("upgrades", 10) then return end
         if not (isfn(G.UpgradeCmds, "All") and isfn(G.UpgradeCmds, "CanInteractWith") and isfn(G.UpgradeCmds, "Purchase")) then return end
         local all = gv(G.UpgradeCmds.All)
         if type(all) ~= "table" then return end
@@ -2561,7 +2667,8 @@ local function buildPlan()
         local egg = state.craftHatch.egg or bestEgg()
         if egg then plan.hatch = { egg = egg, reason = "fodder", gate = state.craftHatch.gate } end
     end
-    if not plan.hatch and CONFIG.AutoHatch and (CONFIG.AlwaysHatch or CONFIG.HatchForStrength) then
+    -- focused: coins stay for quest eggs (strength hatching resumes at max rank)
+    if not plan.hatch and CONFIG.AutoHatch and (CONFIG.AlwaysHatch or (CONFIG.HatchForStrength and not rankFocused())) then
         local egg = bestEgg()
         if egg then plan.hatch = { egg = egg, reason = CONFIG.AlwaysHatch and "always" or "strength", strength = not CONFIG.AlwaysHatch } end
     end
